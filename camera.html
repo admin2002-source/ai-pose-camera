@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Pose Camera</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#071a14;color:#fff;min-height:100vh}
+    .wrap{max-width:1100px;margin:auto;padding:18px}.top{display:flex;gap:14px;justify-content:space-between;align-items:center;flex-wrap:wrap}.brand{font-weight:900;font-size:22px}.muted{color:#b9d7cd;font-size:13px}
+    .grid{display:grid;grid-template-columns:1fr 320px;gap:18px;margin-top:18px}@media(max-width:850px){.grid{grid-template-columns:1fr}}
+    .card{background:#0e2a21;border:1px solid #1e4b3c;border-radius:20px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.2)}
+    .stage{position:relative;background:#000;border-radius:16px;overflow:hidden;aspect-ratio:16/9}.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.hidden{display:none}.pill{display:inline-flex;padding:7px 11px;border-radius:999px;background:#123b2f;color:#baf3df;font-weight:800;font-size:12px}.metric{font-size:56px;font-weight:1000;line-height:1}.row{display:flex;justify-content:space-between;align-items:end;gap:12px}.label{color:#9cc8bb;font-size:12px}.btn{border:0;border-radius:14px;padding:12px 16px;font-weight:900;cursor:pointer}.btn.primary{background:#35d399;color:#062117}.btn.dark{background:#183c31;color:#fff}.btn:disabled{opacity:.45;cursor:not-allowed}.status{padding:12px;border-radius:12px;background:#12372c;color:#ccefe4;font-size:13px;line-height:1.5}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div><div class="brand">🤖 AI Pose Practice Camera</div><div class="muted">กล้องและ MediaPipe ทำงานบน HTTPS แยกจาก Google Apps Script</div></div>
+      <div class="pill" id="lessonInfo">Lesson: -</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="stage">
+          <video id="video" playsinline muted></video>
+          <canvas id="canvas"></canvas>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px">
+          <button class="btn primary" id="startBtn">📷 เปิดกล้อง</button>
+          <button class="btn dark" id="stopBtn" disabled>⏹ หยุดกล้อง</button>
+          <button class="btn primary" id="saveBtn" disabled>✅ ส่งคะแนนกลับ</button>
+        </div>
+        <div class="status" id="status" style="margin-top:12px">พร้อมเริ่ม — กด “เปิดกล้อง” แล้วอนุญาตการใช้งานกล้อง</div>
+      </div>
+
+      <div class="card">
+        <div class="row"><div><div class="label">องศาปัจจุบัน</div><div class="metric"><span id="angle">0</span><span style="font-size:24px">°</span></div></div><div style="text-align:right"><div class="label">องศาเป้าหมาย</div><div style="font-size:30px;font-weight:1000"><span id="target">90</span>°</div></div></div>
+        <div style="margin-top:22px"><div class="label">AI Pose Accuracy</div><div class="metric"><span id="score">0</span><span style="font-size:24px">%</span></div></div>
+        <div style="margin-top:20px" class="muted">ระบบเลือกข้อศอกซ้าย/ขวาที่มีมุมใกล้ Target มากที่สุด แล้วคำนวณคะแนนจากความคลาดเคลื่อนของมุม</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+'use strict';
+const qs = new URLSearchParams(location.search);
+const lessonId = qs.get('lesson') || '';
+const targetAngle = Number(qs.get('angle') || 90);
+const lessonName = qs.get('title') || lessonId || '-';
+const $ = id => document.getElementById(id);
+$('lessonInfo').textContent = `Lesson: ${lessonName}`;
+$('target').textContent = Number.isFinite(targetAngle) ? Math.round(targetAngle) : 90;
+
+let stream = null, camera = null, pose = null, currentScore = 0, currentAngle = 0, history = [], busy = false;
+
+function clamp(v,min,max){ return Math.max(min,Math.min(max,v)); }
+function angle(a,b,c){
+  const ab={x:a.x-b.x,y:a.y-b.y}, cb={x:c.x-b.x,y:c.y-b.y};
+  const mag=Math.sqrt((ab.x*ab.x+ab.y*ab.y)*(cb.x*cb.x+cb.y*cb.y)); if(!mag)return 0;
+  const cos=clamp((ab.x*cb.x+ab.y*cb.y)/mag,-1,1); return Math.acos(cos)*180/Math.PI;
+}
+function triplet(lm,a,b,c){ const pts=[lm[a],lm[b],lm[c]]; if(pts.some(p=>!p||typeof p.x!=='number'||typeof p.y!=='number'||(p.visibility!=null&&p.visibility<.45))) return null; return pts; }
+
+async function init(){
+  pose = new Pose({locateFile:file=>`https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}`});
+  pose.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,minDetectionConfidence:.5,minTrackingConfidence:.5});
+  pose.onResults(onResults);
+}
+
+async function start(){
+  if(stream) return;
+  if(!window.isSecureContext || !navigator.mediaDevices?.getUserMedia){
+    $('status').textContent='ไม่สามารถใช้กล้องได้: หน้านี้ต้องเปิดผ่าน HTTPS และ Browser ต้องรองรับ getUserMedia()'; return;
+  }
+  try{
+    $('status').textContent='กำลังขอสิทธิ์กล้อง...';
+    stream = await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720},facingMode:'user'},audio:false});
+    $('video').srcObject=stream; await $('video').play();
+    await init();
+    camera = new Camera($('video'),{onFrame:async()=>{if(!busy && pose && $('video').readyState>=2){busy=true;try{await pose.send({image:$('video')})}catch(e){console.error(e)}busy=false}},width:1280,height:720});
+    camera.start();
+    $('startBtn').disabled=true; $('stopBtn').disabled=false; $('saveBtn').disabled=false; $('status').textContent='กล้องพร้อม — ยืนให้เห็นช่วงไหล่ถึงข้อมือ แล้วจัดแขนให้ตรงตามองศาเป้าหมาย';
+  }catch(e){ console.error(e); $('status').textContent=`เปิดกล้องไม่สำเร็จ: ${e.name || e.message || e}`; }
+}
+function onResults(r){
+  const c=$('canvas'), v=$('video'), ctx=c.getContext('2d'); c.width=v.videoWidth||1280; c.height=v.videoHeight||720; ctx.clearRect(0,0,c.width,c.height);
+  if(!r.poseLandmarks) return;
+  ctx.save(); ctx.translate(c.width,0); ctx.scale(-1,1); ctx.drawImage(r.image,0,0,c.width,c.height);
+  try{drawConnectors(ctx,r.poseLandmarks,POSE_CONNECTIONS,{color:'#35d399',lineWidth:4});drawLandmarks(ctx,r.poseLandmarks,{color:'#fff',lineWidth:1,radius:4})}catch(_e){} ctx.restore();
+  const right=triplet(r.poseLandmarks,12,14,16), left=triplet(r.poseLandmarks,11,13,15), cand=[];
+  if(right)cand.push({side:'ขวา',a:angle(...right)}); if(left)cand.push({side:'ซ้าย',a:angle(...left)}); if(!cand.length)return;
+  cand.sort((x,y)=>Math.abs(x.a-targetAngle)-Math.abs(y.a-targetAngle)); const best=cand[0]; const diff=Math.abs(best.a-targetAngle); const raw=clamp(100-diff*2.5,0,100);
+  history.push(raw); if(history.length>12)history.shift(); currentScore=history.reduce((a,b)=>a+b,0)/history.length; currentAngle=best.a;
+  $('angle').textContent=Math.round(currentAngle); $('score').textContent=Math.round(currentScore);
+  ctx.save(); ctx.fillStyle='#fff'; ctx.font='700 22px system-ui'; ctx.fillText(`${best.side} elbow ${Math.round(best.a)}°  |  AI ${Math.round(currentScore)}%`,24,44); ctx.restore();
+}
+function stop(){
+  try{camera?.stop?.();}catch(_e){} camera=null; if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;} $('video').srcObject=null; $('startBtn').disabled=false; $('stopBtn').disabled=true; $('saveBtn').disabled=true; $('status').textContent='หยุดกล้องแล้ว';
+}
+function sendScore(closeAfter=false){
+  if(!currentScore){$('status').textContent='ยังไม่มีคะแนน กรุณาเปิดกล้องและให้ระบบตรวจจับท่าทางก่อน';return;}
+  window.opener?.postMessage({type:'POSE_SCORE',lessonId,score:Math.round(currentScore),angle:Number(currentAngle.toFixed(1))},'*');
+  if(closeAfter){ window.opener?.postMessage({type:'POSE_SAVED',lessonId},'*'); setTimeout(()=>window.close(),300); }
+  $('status').textContent=`ส่งคะแนน AI ${Math.round(currentScore)}% กลับหน้าเว็บหลักแล้ว`;
+}
+$('startBtn').addEventListener('click',start); $('stopBtn').addEventListener('click',stop); $('saveBtn').addEventListener('click',()=>sendScore(true));
+window.addEventListener('beforeunload',stop);
+</script>
+</body>
+</html>
